@@ -803,46 +803,76 @@
                 scene.remove(model);
             }
 
+            console.log('Loading model from:', url);
+
             const loader = new THREE.GLTFLoader();
             loader.load(
                 url,
                 (gltf) => {
+                    console.log('GLTF loaded:', gltf);
                     model = gltf.scene;
+
+                    let hasGeometry = false;
+
+                    // Process all meshes and convert point clouds to visible points
+                    model.traverse((child) => {
+                        console.log('Child:', child.type, child);
+
+                        if (child.isMesh) {
+                            hasGeometry = true;
+                            const geometry = child.geometry;
+
+                            // Check if this is actually a point cloud (no indices or mode 0)
+                            if (!geometry.index || geometry.index.count === 0) {
+                                // Convert mesh to points for better visibility
+                                const pointsMaterial = new THREE.PointsMaterial({
+                                    size: 0.05,
+                                    vertexColors: true,
+                                    sizeAttenuation: true
+                                });
+                                const points = new THREE.Points(geometry, pointsMaterial);
+                                points.position.copy(child.position);
+                                points.rotation.copy(child.rotation);
+                                points.scale.copy(child.scale);
+                                child.parent.add(points);
+                                child.visible = false;
+                                console.log('Converted to points:', points);
+                            } else {
+                                // Regular mesh
+                                child.material.vertexColors = true;
+                                child.material.side = THREE.DoubleSide;
+                            }
+                        }
+                    });
 
                     // Center and scale model
                     const box = new THREE.Box3().setFromObject(model);
                     const center = box.getCenter(new THREE.Vector3());
                     const size = box.getSize(new THREE.Vector3());
 
-                    model.position.sub(center);
+                    console.log('Model bounds:', { center, size });
 
-                    const maxDim = Math.max(size.x, size.y, size.z);
-                    if (maxDim > 0) {
-                        const scale = 2 / maxDim;
-                        model.scale.multiplyScalar(scale);
-                    }
-
-                    // Add point size for point clouds
-                    model.traverse((child) => {
-                        if (child.isMesh || child.isPoints) {
-                            if (child.material) {
-                                child.material.vertexColors = true;
-                                if (child.isPoints) {
-                                    child.material.size = 0.02;
-                                    child.material.sizeAttenuation = true;
-                                }
-                            }
+                    if (size.length() > 0) {
+                        model.position.sub(center);
+                        const maxDim = Math.max(size.x, size.y, size.z);
+                        if (maxDim > 0) {
+                            const scale = 2 / maxDim;
+                            model.scale.multiplyScalar(scale);
                         }
-                    });
+                    }
 
                     scene.add(model);
                     resetView();
+                    console.log('Model added to scene');
                 },
                 (progress) => {
-                    console.log('Loading:', (progress.loaded / progress.total * 100) + '%');
+                    if (progress.total > 0) {
+                        console.log('Loading:', (progress.loaded / progress.total * 100).toFixed(1) + '%');
+                    }
                 },
                 (error) => {
                     console.error('Error loading model:', error);
+                    alert('Error loading 3D model. Check console for details.');
                 }
             );
         }
