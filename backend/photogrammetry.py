@@ -322,6 +322,17 @@ class PhotogrammetryPipeline:
             img1 = self.images[idx]
             img2 = self.images[idx + 1]
 
+            # Resize images to same size (use smaller dimensions)
+            h1, w1 = img1.shape[:2]
+            h2, w2 = img2.shape[:2]
+            target_h = min(h1, h2)
+            target_w = min(w1, w2)
+
+            if (h1, w1) != (target_h, target_w):
+                img1 = cv2.resize(img1, (target_w, target_h))
+            if (h2, w2) != (target_h, target_w):
+                img2 = cv2.resize(img2, (target_w, target_h))
+
             gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
             gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
 
