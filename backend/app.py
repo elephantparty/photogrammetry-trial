@@ -94,20 +94,57 @@ async def upload_photos(
 
     # Save uploaded files
     saved_files = []
+    valid_extensions = [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]
+
     for i, file in enumerate(files):
-        if not file.content_type or not file.content_type.startswith("image/"):
+        # Get extension from filename
+        ext = Path(file.filename).suffix.lower() if file.filename else ""
+
+        # Accept if it looks like an image (by extension or content type)
+        is_image = (
+            ext in valid_extensions or
+            (file.content_type and file.content_type.startswith("image/"))
+        )
+
+        if not is_image:
+            print(f"Skipping {file.filename}: not recognized as image")
             continue
 
-        ext = Path(file.filename).suffix.lower() or ".jpg"
+        content = await file.read()
+        if len(content) < 1000:  # Skip tiny/empty files
+            print(f"Skipping {file.filename}: file too small")
+            continue
+
+        # Convert HEIC/HEIF to JPEG
+        if ext in [".heic", ".heif"]:
+            try:
+                from PIL import Image
+                import io
+                try:
+                    from pillow_heif import register_heif_opener
+                    register_heif_opener()
+                except ImportError:
+                    print("pillow-heif not installed, trying direct PIL load")
+
+                img = Image.open(io.BytesIO(content))
+                output = io.BytesIO()
+                img.convert("RGB").save(output, format="JPEG", quality=95)
+                content = output.getvalue()
+                ext = ".jpg"
+            except Exception as e:
+                print(f"Failed to convert HEIC {file.filename}: {e}")
+                continue
+
+        # Normalize extension
         if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
             ext = ".jpg"
 
         file_path = job_dir / f"image_{i:03d}{ext}"
-        content = await file.read()
 
         with open(file_path, "wb") as f:
             f.write(content)
         saved_files.append(str(file_path))
+        print(f"Saved {file.filename} -> {file_path}")
 
     if len(saved_files) < 3:
         raise HTTPException(
