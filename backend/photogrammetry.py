@@ -1,6 +1,6 @@
 """
-Photogrammetry Pipeline
-Reconstructs 3D models from multiple 2D images using Structure from Motion (SfM).
+Photogrammetry Pipeline v2
+Improved 3D reconstruction with better feature matching and filtering.
 """
 import cv2
 import numpy as np
@@ -14,10 +14,10 @@ import struct
 @dataclass
 class CameraIntrinsics:
     """Camera intrinsic parameters."""
-    fx: float  # focal length x
-    fy: float  # focal length y
-    cx: float  # principal point x
-    cy: float  # principal point y
+    fx: float
+    fy: float
+    cx: float
+    cy: float
 
     def matrix(self) -> np.ndarray:
         return np.array([
@@ -28,27 +28,19 @@ class CameraIntrinsics:
 
 
 @dataclass
-class ImageFeatures:
-    """Detected features for an image."""
-    image_idx: int
+class ImageData:
+    """Processed image data."""
+    idx: int
+    image: np.ndarray
+    gray: np.ndarray
     keypoints: List[cv2.KeyPoint]
     descriptors: np.ndarray
-    image_shape: Tuple[int, int]
+    shape: Tuple[int, int]
 
 
 class PhotogrammetryPipeline:
     """
-    Complete photogrammetry pipeline for 3D reconstruction.
-
-    Steps:
-    1. Load and preprocess images
-    2. Detect features (SIFT)
-    3. Match features between image pairs
-    4. Estimate camera poses using Essential matrix
-    5. Triangulate 3D points
-    6. Bundle adjustment (simplified)
-    7. Generate dense point cloud
-    8. Create mesh and export to GLB
+    Improved photogrammetry pipeline for 3D reconstruction.
     """
 
     def __init__(
@@ -62,539 +54,505 @@ class PhotogrammetryPipeline:
         self.output_dir.mkdir(exist_ok=True)
         self.progress_callback = progress_callback or (lambda p, m: None)
 
-        # Pipeline state
-        self.images: List[np.ndarray] = []
-        self.image_features: List[ImageFeatures] = []
-        self.matches: Dict[Tuple[int, int], List] = {}
-        self.camera_poses: List[np.ndarray] = []
+        # Results
+        self.images: List[ImageData] = []
+        self.matches: Dict[Tuple[int, int], np.ndarray] = {}
         self.points_3d: np.ndarray = None
         self.point_colors: np.ndarray = None
         self.intrinsics: CameraIntrinsics = None
+        self.triangles = None
 
-        # Feature detector
-        self.feature_detector = cv2.SIFT_create(nfeatures=5000)
-        self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        # Use SIFT with more features for better matching
+        self.detector = cv2.SIFT_create(
+            nfeatures=8000,
+            contrastThreshold=0.02,
+            edgeThreshold=20
+        )
+
+        # FLANN matcher for faster, better matching
+        index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
+        search_params = dict(checks=100)
+        self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
 
     def run(self) -> Dict:
-        """Execute the full photogrammetry pipeline."""
+        """Execute the photogrammetry pipeline."""
         try:
-            # Step 1: Load images
-            self.progress_callback(10, "Loading and analyzing images...")
+            self.progress_callback(5, "Loading images...")
             self._load_images()
 
-            # Step 2: Detect features
-            self.progress_callback(20, "Detecting image features...")
+            self.progress_callback(15, "Detecting features...")
             self._detect_features()
 
-            # Step 3: Match features
-            self.progress_callback(35, "Matching features between images...")
+            self.progress_callback(30, "Matching features across images...")
             self._match_features()
 
-            # Step 4: Estimate camera poses
-            self.progress_callback(50, "Estimating camera positions...")
-            self._estimate_poses()
+            self.progress_callback(50, "Reconstructing 3D structure...")
+            self._reconstruct()
 
-            # Step 5: Triangulate points
-            self.progress_callback(65, "Triangulating 3D points...")
-            self._triangulate_points()
+            self.progress_callback(75, "Filtering and refining point cloud...")
+            self._filter_points()
 
-            # Step 6: Dense reconstruction
-            self.progress_callback(75, "Generating dense point cloud...")
-            self._dense_reconstruction()
-
-            # Step 7: Generate mesh
-            self.progress_callback(85, "Creating 3D mesh...")
+            self.progress_callback(85, "Generating mesh...")
             self._generate_mesh()
 
-            # Step 8: Export to GLB
-            self.progress_callback(95, "Exporting 3D model...")
+            self.progress_callback(92, "Exporting model...")
             self._export_glb()
-
-            # Generate preview
             self._generate_preview()
+            self._export_ply()
 
             self.progress_callback(100, "Complete!")
 
             return {
                 "success": True,
-                "points": len(self.points_3d) if self.points_3d is not None else 0,
-                "model_path": str(self.output_dir / "model.glb")
+                "points": len(self.points_3d) if self.points_3d is not None else 0
             }
 
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
 
     def _load_images(self):
-        """Load and preprocess all images."""
-        for path in self.image_paths:
+        """Load and preprocess images to consistent size."""
+        target_size = None
+
+        for idx, path in enumerate(self.image_paths):
             img = cv2.imread(str(path))
             if img is None:
                 continue
 
-            # Resize if too large (max 1920px on longest side)
-            max_dim = 1920
+            # Resize large images
             h, w = img.shape[:2]
+            max_dim = 1600
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)
-                img = cv2.resize(img, None, fx=scale, fy=scale)
+                img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-            self.images.append(img)
+            # Store first image size as target
+            if target_size is None:
+                target_size = img.shape[:2]
 
-        if len(self.images) < 3:
-            raise ValueError("Need at least 3 valid images")
-
-        # Estimate camera intrinsics from first image
-        h, w = self.images[0].shape[:2]
-        focal = max(h, w) * 1.2  # Rough estimate
-        self.intrinsics = CameraIntrinsics(
-            fx=focal, fy=focal,
-            cx=w / 2, cy=h / 2
-        )
-
-    def _detect_features(self):
-        """Detect SIFT features in all images."""
-        for idx, img in enumerate(self.images):
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            keypoints, descriptors = self.feature_detector.detectAndCompute(gray, None)
 
-            if descriptors is None or len(keypoints) < 10:
-                continue
-
-            self.image_features.append(ImageFeatures(
-                image_idx=idx,
-                keypoints=keypoints,
-                descriptors=descriptors,
-                image_shape=img.shape[:2]
+            self.images.append(ImageData(
+                idx=idx,
+                image=img,
+                gray=gray,
+                keypoints=[],
+                descriptors=None,
+                shape=img.shape[:2]
             ))
 
+        if len(self.images) < 3:
+            raise ValueError(f"Need at least 3 valid images, got {len(self.images)}")
+
+        # Estimate camera intrinsics from image size
+        h, w = self.images[0].shape
+        focal = max(h, w) * 1.2
+        self.intrinsics = CameraIntrinsics(fx=focal, fy=focal, cx=w/2, cy=h/2)
+
+    def _detect_features(self):
+        """Detect SIFT features with adaptive thresholding."""
+        for img_data in self.images:
+            # Apply CLAHE for better feature detection
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(img_data.gray)
+
+            kp, desc = self.detector.detectAndCompute(enhanced, None)
+
+            if desc is not None and len(kp) >= 100:
+                img_data.keypoints = kp
+                img_data.descriptors = desc
+            else:
+                # Retry with lower threshold
+                detector = cv2.SIFT_create(nfeatures=5000, contrastThreshold=0.01)
+                kp, desc = detector.detectAndCompute(enhanced, None)
+                img_data.keypoints = kp if kp else []
+                img_data.descriptors = desc
+
+        # Filter images without enough features
+        self.images = [img for img in self.images if img.descriptors is not None and len(img.keypoints) >= 50]
+
+        if len(self.images) < 3:
+            raise ValueError("Not enough features detected in images")
+
     def _match_features(self):
-        """Match features between image pairs."""
-        n = len(self.image_features)
+        """Match features between all image pairs with geometric verification."""
+        n = len(self.images)
+        K = self.intrinsics.matrix()
 
         for i in range(n):
             for j in range(i + 1, n):
-                feat_i = self.image_features[i]
-                feat_j = self.image_features[j]
+                img_i = self.images[i]
+                img_j = self.images[j]
 
-                # KNN matching with ratio test
-                matches = self.matcher.knnMatch(
-                    feat_i.descriptors,
-                    feat_j.descriptors,
-                    k=2
-                )
+                if img_i.descriptors is None or img_j.descriptors is None:
+                    continue
 
-                # Apply Lowe's ratio test
-                good_matches = []
-                for m_list in matches:
+                # KNN matching
+                try:
+                    raw_matches = self.matcher.knnMatch(img_i.descriptors, img_j.descriptors, k=2)
+                except cv2.error:
+                    continue
+
+                # Ratio test
+                good = []
+                for m_list in raw_matches:
                     if len(m_list) == 2:
                         m, n_match = m_list
-                        if m.distance < 0.75 * n_match.distance:
-                            good_matches.append(m)
+                        if m.distance < 0.7 * n_match.distance:
+                            good.append(m)
 
-                if len(good_matches) >= 20:
-                    self.matches[(i, j)] = good_matches
+                if len(good) < 20:
+                    continue
 
-    def _estimate_poses(self):
-        """Estimate camera poses using essential matrix decomposition."""
+                # Get point coordinates
+                pts_i = np.float32([img_i.keypoints[m.queryIdx].pt for m in good])
+                pts_j = np.float32([img_j.keypoints[m.trainIdx].pt for m in good])
+
+                # Geometric verification with fundamental matrix
+                F, mask = cv2.findFundamentalMat(pts_i, pts_j, cv2.FM_RANSAC, 2.0, 0.99)
+
+                if F is None or mask is None:
+                    continue
+
+                mask = mask.ravel().astype(bool)
+                inlier_count = np.sum(mask)
+
+                if inlier_count >= 15:
+                    # Store verified matches
+                    verified_matches = np.array([
+                        [good[k].queryIdx, good[k].trainIdx]
+                        for k in range(len(good)) if mask[k]
+                    ])
+                    self.matches[(i, j)] = verified_matches
+
+        if len(self.matches) < 2:
+            raise ValueError("Not enough matching image pairs found")
+
+    def _reconstruct(self):
+        """Incremental structure from motion reconstruction."""
         K = self.intrinsics.matrix()
-        n = len(self.image_features)
 
-        # Initialize first camera at origin
-        self.camera_poses = [np.eye(4, dtype=np.float64)]
+        # Find best initial pair (most matches)
+        best_pair = max(self.matches.keys(), key=lambda k: len(self.matches[k]))
+        i, j = best_pair
 
-        # Process subsequent cameras
-        for i in range(1, n):
-            best_pose = None
-            best_inliers = 0
+        # Initialize with first pair
+        matches = self.matches[best_pair]
+        pts_i = np.float32([self.images[i].keypoints[m[0]].pt for m in matches])
+        pts_j = np.float32([self.images[j].keypoints[m[1]].pt for m in matches])
 
-            # Try matching with previous cameras
-            for j in range(i):
-                key = (j, i) if (j, i) in self.matches else (i, j)
-                if key not in self.matches:
-                    continue
+        # Find essential matrix and recover pose
+        E, mask = cv2.findEssentialMat(pts_i, pts_j, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
 
-                matches = self.matches[key]
-                feat_i = self.image_features[j]
-                feat_j = self.image_features[i]
+        if E is None:
+            raise ValueError("Could not compute essential matrix")
 
-                # Get matched points
-                pts1 = np.float64([feat_i.keypoints[m.queryIdx].pt for m in matches])
-                pts2 = np.float64([feat_j.keypoints[m.trainIdx].pt for m in matches])
+        mask = mask.ravel().astype(bool)
+        _, R, t, pose_mask = cv2.recoverPose(E, pts_i[mask], pts_j[mask], K)
 
-                # Find essential matrix
-                E, mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        # Projection matrices
+        P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P2 = K @ np.hstack([R, t])
 
-                if E is None:
-                    continue
+        # Triangulate initial points
+        pts_i_masked = pts_i[mask]
+        pts_j_masked = pts_j[mask]
 
-                inliers = np.sum(mask)
-                if inliers < 20:
-                    continue
+        points_4d = cv2.triangulatePoints(P1, P2, pts_i_masked.T, pts_j_masked.T)
+        points_3d = (points_4d[:3] / points_4d[3]).T
 
-                # Recover pose
-                _, R, t, pose_mask = cv2.recoverPose(E, pts1, pts2, K, mask=mask)
+        # Filter by reprojection error and depth
+        valid_mask = self._filter_triangulated_points(points_3d, pts_i_masked, pts_j_masked, P1, P2)
+        points_3d = points_3d[valid_mask]
 
-                if inliers > best_inliers:
-                    best_inliers = inliers
-                    # Compose with reference camera pose
-                    ref_pose = self.camera_poses[j]
-                    best_pose = np.eye(4, dtype=np.float64)
-                    best_pose[:3, :3] = R @ ref_pose[:3, :3]
-                    best_pose[:3, 3] = ref_pose[:3, :3].T @ t.flatten() + ref_pose[:3, 3]
-
-            if best_pose is not None:
-                self.camera_poses.append(best_pose)
+        # Get colors from first image
+        colors = []
+        for pt2d in pts_i_masked[valid_mask]:
+            x, y = int(pt2d[0]), int(pt2d[1])
+            img = self.images[i].image
+            if 0 <= y < img.shape[0] and 0 <= x < img.shape[1]:
+                colors.append(img[y, x][::-1] / 255.0)
             else:
-                # Fall back to identity with offset
-                pose = np.eye(4, dtype=np.float64)
-                pose[2, 3] = -0.5 * i  # Simple translation along Z
-                self.camera_poses.append(pose)
+                colors.append([0.5, 0.5, 0.5])
 
-    def _triangulate_points(self):
-        """Triangulate 3D points from matched features."""
-        K = self.intrinsics.matrix()
-        all_points = []
-        all_colors = []
+        all_points = list(points_3d)
+        all_colors = list(colors)
 
-        # Triangulate from pairs of cameras
-        for (i, j), matches in self.matches.items():
-            if i >= len(self.camera_poses) or j >= len(self.camera_poses):
+        # Add points from other image pairs
+        camera_poses = {i: np.eye(4), j: np.eye(4)}
+        camera_poses[j][:3, :3] = R
+        camera_poses[j][:3, 3] = t.flatten()
+
+        for (idx_a, idx_b), matches in self.matches.items():
+            if (idx_a, idx_b) == best_pair:
                 continue
 
-            feat_i = self.image_features[i]
-            feat_j = self.image_features[j]
+            # Get points
+            pts_a = np.float32([self.images[idx_a].keypoints[m[0]].pt for m in matches])
+            pts_b = np.float32([self.images[idx_b].keypoints[m[1]].pt for m in matches])
 
-            # Get matched points
-            pts1 = np.float64([feat_i.keypoints[m.queryIdx].pt for m in matches])
-            pts2 = np.float64([feat_j.keypoints[m.trainIdx].pt for m in matches])
+            # Try to find essential matrix
+            E, mask = cv2.findEssentialMat(pts_a, pts_b, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
 
-            # Projection matrices
-            P1 = K @ self.camera_poses[i][:3]
-            P2 = K @ self.camera_poses[j][:3]
+            if E is None:
+                continue
+
+            mask = mask.ravel().astype(bool)
+            if np.sum(mask) < 10:
+                continue
+
+            _, R_ab, t_ab, _ = cv2.recoverPose(E, pts_a[mask], pts_b[mask], K)
 
             # Triangulate
-            pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
-            pts3d = (pts4d[:3] / pts4d[3]).T
+            P_a = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+            P_b = K @ np.hstack([R_ab, t_ab])
 
-            # Filter points (remove outliers)
-            valid = np.abs(pts3d).max(axis=1) < 100
+            pts_a_masked = pts_a[mask]
+            pts_b_masked = pts_b[mask]
 
-            # Get colors from first image
-            img = self.images[feat_i.image_idx]
-            colors = []
-            for pt, m in zip(pts3d, matches):
-                kp = feat_i.keypoints[m.queryIdx].pt
-                x, y = int(kp[0]), int(kp[1])
+            points_4d = cv2.triangulatePoints(P_a, P_b, pts_a_masked.T, pts_b_masked.T)
+            new_points = (points_4d[:3] / points_4d[3]).T
+
+            # Filter
+            valid = self._filter_triangulated_points(new_points, pts_a_masked, pts_b_masked, P_a, P_b)
+            new_points = new_points[valid]
+
+            # Colors
+            for pt2d in pts_a_masked[valid]:
+                x, y = int(pt2d[0]), int(pt2d[1])
+                img = self.images[idx_a].image
                 if 0 <= y < img.shape[0] and 0 <= x < img.shape[1]:
-                    color = img[y, x][::-1] / 255.0  # BGR to RGB, normalize
-                    colors.append(color)
+                    all_colors.append(img[y, x][::-1] / 255.0)
                 else:
-                    colors.append([0.5, 0.5, 0.5])
+                    all_colors.append([0.5, 0.5, 0.5])
 
-            colors = np.array(colors)
-            all_points.extend(pts3d[valid])
-            all_colors.extend(colors[valid])
+            all_points.extend(new_points)
 
-        if len(all_points) == 0:
-            raise ValueError("Could not triangulate any points")
+        if len(all_points) < 10:
+            raise ValueError(f"Only {len(all_points)} points reconstructed, need more overlap between photos")
 
         self.points_3d = np.array(all_points)
         self.point_colors = np.array(all_colors)
 
-        # Center and scale the point cloud
-        centroid = np.median(self.points_3d, axis=0)
-        self.points_3d -= centroid
-        scale = np.percentile(np.abs(self.points_3d), 95)
-        if scale > 0:
-            self.points_3d /= scale
+    def _filter_triangulated_points(self, points_3d, pts1, pts2, P1, P2, max_reproj_error=5.0):
+        """Filter points by reprojection error and depth."""
+        valid = np.ones(len(points_3d), dtype=bool)
 
-    def _dense_reconstruction(self):
-        """Generate denser point cloud using patch-based stereo."""
-        K = self.intrinsics.matrix()
-        dense_points = list(self.points_3d)
-        dense_colors = list(self.point_colors)
+        for idx, (pt3d, pt1, pt2) in enumerate(zip(points_3d, pts1, pts2)):
+            # Check if point is in front of both cameras
+            pt_h = np.append(pt3d, 1)
 
-        # Use stereo matching for additional points (simplified)
-        for idx in range(min(3, len(self.images) - 1)):
-            img1 = self.images[idx]
-            img2 = self.images[idx + 1]
+            # Depth check (z > 0 in camera coordinates)
+            z1 = pt3d[2]
+            z2 = (P2 @ pt_h)[2]
 
-            # Resize images to same size (use smaller dimensions)
-            h1, w1 = img1.shape[:2]
-            h2, w2 = img2.shape[:2]
-            target_h = min(h1, h2)
-            target_w = min(w1, w2)
+            if z1 <= 0.1 or z2 <= 0.1:
+                valid[idx] = False
+                continue
 
-            if (h1, w1) != (target_h, target_w):
-                img1 = cv2.resize(img1, (target_w, target_h))
-            if (h2, w2) != (target_h, target_w):
-                img2 = cv2.resize(img2, (target_w, target_h))
+            # Reprojection error
+            proj1 = P1 @ pt_h
+            proj1 = proj1[:2] / proj1[2]
+            err1 = np.linalg.norm(proj1 - pt1)
 
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+            proj2 = P2 @ pt_h
+            proj2 = proj2[:2] / proj2[2]
+            err2 = np.linalg.norm(proj2 - pt2)
 
-            # Compute stereo disparity
-            stereo = cv2.StereoBM.create(numDisparities=64, blockSize=15)
-            disparity = stereo.compute(gray1, gray2).astype(np.float32) / 16.0
+            if err1 > max_reproj_error or err2 > max_reproj_error:
+                valid[idx] = False
+                continue
 
-            # Convert disparity to 3D points (sampled)
-            h, w = disparity.shape
-            step = 8  # Sample every 8 pixels
+            # Check for extreme distances
+            if np.linalg.norm(pt3d) > 100:
+                valid[idx] = False
 
-            for y in range(0, h, step):
-                for x in range(0, w, step):
-                    d = disparity[y, x]
-                    if d > 1:  # Valid disparity
-                        # Approximate 3D point
-                        Z = (K[0, 0] * 0.1) / d  # baseline ~0.1
-                        X = (x - K[0, 2]) * Z / K[0, 0]
-                        Y = (y - K[1, 2]) * Z / K[1, 1]
+        return valid
 
-                        if abs(X) < 5 and abs(Y) < 5 and 0 < Z < 10:
-                            dense_points.append([X, Y, Z])
-                            color = img1[y, x][::-1] / 255.0
-                            dense_colors.append(color)
-
-        self.points_3d = np.array(dense_points)
-        self.point_colors = np.array(dense_colors)
-
-        # Remove outliers using statistical filtering
-        if len(self.points_3d) > 100:
-            mean = np.mean(self.points_3d, axis=0)
-            std = np.std(self.points_3d, axis=0)
-            mask = np.all(np.abs(self.points_3d - mean) < 3 * std, axis=1)
-            self.points_3d = self.points_3d[mask]
-            self.point_colors = self.point_colors[mask]
-
-    def _generate_mesh(self):
-        """Generate a mesh from point cloud using ball pivoting or Poisson."""
-        # Simple mesh generation using Delaunay triangulation on projected points
-        # For better results, use Open3D or similar library
-
-        if len(self.points_3d) < 4:
+    def _filter_points(self):
+        """Statistical outlier removal and normalization."""
+        if len(self.points_3d) < 10:
             return
 
-        from scipy.spatial import Delaunay
+        points = self.points_3d
+        colors = self.point_colors
 
-        # Project to 2D for triangulation (XY plane)
-        points_2d = self.points_3d[:, :2]
+        # Remove statistical outliers (points far from neighbors)
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(points)
+        k = min(20, len(points) - 1)
+        distances, _ = tree.query(points, k=k+1)
+        mean_distances = distances[:, 1:].mean(axis=1)
+
+        threshold = np.mean(mean_distances) + 2 * np.std(mean_distances)
+        inlier_mask = mean_distances < threshold
+
+        points = points[inlier_mask]
+        colors = colors[inlier_mask]
+
+        if len(points) < 10:
+            raise ValueError("Too few points after filtering")
+
+        # Center and normalize
+        centroid = np.median(points, axis=0)
+        points = points - centroid
+
+        # Scale to unit sphere
+        scale = np.percentile(np.linalg.norm(points, axis=1), 95)
+        if scale > 0:
+            points = points / scale
+
+        self.points_3d = points
+        self.point_colors = colors
+
+    def _generate_mesh(self):
+        """Generate mesh using Delaunay triangulation with better filtering."""
+        if len(self.points_3d) < 4:
+            self.triangles = None
+            return
 
         try:
+            from scipy.spatial import Delaunay
+
+            # Project to 2D for triangulation
+            points_2d = self.points_3d[:, :2]
+
             tri = Delaunay(points_2d)
-            self.triangles = tri.simplices
+            triangles = tri.simplices
 
-            # Filter long triangles (outliers)
-            valid_triangles = []
-            max_edge_length = 0.5  # Threshold
+            # Filter triangles by edge length and aspect ratio
+            valid = []
+            median_dist = np.median(np.linalg.norm(
+                self.points_3d[triangles[:, 0]] - self.points_3d[triangles[:, 1]], axis=1
+            ))
+            max_edge = median_dist * 3
 
-            for t in self.triangles:
+            for t in triangles:
                 p0, p1, p2 = self.points_3d[t]
-                e1 = np.linalg.norm(p1 - p0)
-                e2 = np.linalg.norm(p2 - p1)
-                e3 = np.linalg.norm(p0 - p2)
+                edges = [
+                    np.linalg.norm(p1 - p0),
+                    np.linalg.norm(p2 - p1),
+                    np.linalg.norm(p0 - p2)
+                ]
 
-                if max(e1, e2, e3) < max_edge_length:
-                    valid_triangles.append(t)
+                if max(edges) < max_edge and min(edges) > 0.001:
+                    # Check aspect ratio
+                    if max(edges) / min(edges) < 10:
+                        valid.append(t)
 
-            self.triangles = np.array(valid_triangles) if valid_triangles else tri.simplices
+            self.triangles = np.array(valid) if valid else None
 
-        except Exception:
-            # Fallback: create simple quad mesh
+        except Exception as e:
+            print(f"Mesh generation failed: {e}")
             self.triangles = None
 
     def _export_glb(self):
-        """Export the model to GLB (binary glTF) format."""
+        """Export to GLB format."""
         output_path = self.output_dir / "model.glb"
 
-        # Build glTF structure
-        gltf = self._build_gltf()
-
-        # Write GLB
-        self._write_glb(gltf, output_path)
-
-    def _build_gltf(self) -> dict:
-        """Build glTF JSON structure."""
         points = self.points_3d.astype(np.float32)
-        colors = (self.point_colors * 255).astype(np.uint8)
+        colors = (np.clip(self.point_colors, 0, 1) * 255).astype(np.uint8)
 
-        # Compute bounds
         min_pos = points.min(axis=0).tolist()
         max_pos = points.max(axis=0).tolist()
 
-        # Binary buffer data
         position_data = points.tobytes()
         color_data = colors.tobytes()
 
-        # Check if we have triangles for mesh, otherwise use point cloud
-        has_mesh = hasattr(self, 'triangles') and self.triangles is not None and len(self.triangles) > 0
+        has_mesh = self.triangles is not None and len(self.triangles) > 0
 
         if has_mesh:
-            indices = self.triangles.astype(np.uint32)
+            indices = self.triangles.flatten().astype(np.uint32)
             indices_data = indices.tobytes()
             buffer_data = position_data + color_data + indices_data
         else:
             buffer_data = position_data + color_data
 
         gltf = {
-            "asset": {"version": "2.0", "generator": "Photogrammetry Pipeline"},
+            "asset": {"version": "2.0", "generator": "Photogrammetry Pipeline v2"},
             "scene": 0,
             "scenes": [{"nodes": [0]}],
             "nodes": [{"mesh": 0}],
             "buffers": [{"byteLength": len(buffer_data)}],
             "bufferViews": [
-                # Position buffer view
-                {
-                    "buffer": 0,
-                    "byteOffset": 0,
-                    "byteLength": len(position_data),
-                    "target": 34962  # ARRAY_BUFFER
-                },
-                # Color buffer view
-                {
-                    "buffer": 0,
-                    "byteOffset": len(position_data),
-                    "byteLength": len(color_data),
-                    "target": 34962
-                }
+                {"buffer": 0, "byteOffset": 0, "byteLength": len(position_data), "target": 34962},
+                {"buffer": 0, "byteOffset": len(position_data), "byteLength": len(color_data), "target": 34962}
             ],
             "accessors": [
-                # Position accessor
                 {
-                    "bufferView": 0,
-                    "byteOffset": 0,
-                    "componentType": 5126,  # FLOAT
-                    "count": len(points),
-                    "type": "VEC3",
-                    "min": min_pos,
-                    "max": max_pos
+                    "bufferView": 0, "byteOffset": 0, "componentType": 5126,
+                    "count": len(points), "type": "VEC3", "min": min_pos, "max": max_pos
                 },
-                # Color accessor
                 {
-                    "bufferView": 1,
-                    "byteOffset": 0,
-                    "componentType": 5121,  # UNSIGNED_BYTE
-                    "normalized": True,
-                    "count": len(colors),
-                    "type": "VEC3"
+                    "bufferView": 1, "byteOffset": 0, "componentType": 5121,
+                    "normalized": True, "count": len(colors), "type": "VEC3"
                 }
             ],
-            "materials": [
-                {
-                    "pbrMetallicRoughness": {
-                        "metallicFactor": 0.0,
-                        "roughnessFactor": 1.0
-                    },
-                    "doubleSided": True
-                }
-            ]
+            "materials": [{"pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": True}]
         }
 
         if has_mesh:
-            # Add indices buffer view and accessor
             gltf["bufferViews"].append({
                 "buffer": 0,
                 "byteOffset": len(position_data) + len(color_data),
                 "byteLength": len(indices_data),
-                "target": 34963  # ELEMENT_ARRAY_BUFFER
+                "target": 34963
             })
             gltf["accessors"].append({
-                "bufferView": 2,
-                "byteOffset": 0,
-                "componentType": 5125,  # UNSIGNED_INT
-                "count": len(indices.flatten()),
-                "type": "SCALAR"
+                "bufferView": 2, "byteOffset": 0, "componentType": 5125,
+                "count": len(indices), "type": "SCALAR"
             })
-            gltf["meshes"] = [{
-                "primitives": [{
-                    "attributes": {"POSITION": 0, "COLOR_0": 1},
-                    "indices": 2,
-                    "material": 0,
-                    "mode": 4  # TRIANGLES
-                }]
-            }]
+            gltf["meshes"] = [{"primitives": [{"attributes": {"POSITION": 0, "COLOR_0": 1}, "indices": 2, "material": 0, "mode": 4}]}]
         else:
-            # Point cloud mode
-            gltf["meshes"] = [{
-                "primitives": [{
-                    "attributes": {"POSITION": 0, "COLOR_0": 1},
-                    "material": 0,
-                    "mode": 0  # POINTS
-                }]
-            }]
+            gltf["meshes"] = [{"primitives": [{"attributes": {"POSITION": 0, "COLOR_0": 1}, "material": 0, "mode": 0}]}]
 
-        return {"json": gltf, "buffer": buffer_data}
-
-    def _write_glb(self, gltf: dict, output_path: Path):
-        """Write GLB binary file."""
-        json_str = json.dumps(gltf["json"], separators=(',', ':'))
-
-        # Pad JSON to 4-byte alignment
+        # Write GLB
+        json_str = json.dumps(gltf, separators=(',', ':'))
         while len(json_str) % 4 != 0:
             json_str += ' '
-
         json_bytes = json_str.encode('utf-8')
-        bin_data = gltf["buffer"]
 
-        # Pad binary to 4-byte alignment
-        while len(bin_data) % 4 != 0:
-            bin_data += b'\x00'
+        while len(buffer_data) % 4 != 0:
+            buffer_data += b'\x00'
 
-        # GLB header
-        total_length = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
+        total_length = 12 + 8 + len(json_bytes) + 8 + len(buffer_data)
 
         with open(output_path, 'wb') as f:
-            # Header
-            f.write(b'glTF')  # magic
-            f.write(struct.pack('<I', 2))  # version
-            f.write(struct.pack('<I', total_length))  # length
-
-            # JSON chunk
-            f.write(struct.pack('<I', len(json_bytes)))  # chunk length
-            f.write(b'JSON')  # chunk type
+            f.write(b'glTF')
+            f.write(struct.pack('<I', 2))
+            f.write(struct.pack('<I', total_length))
+            f.write(struct.pack('<I', len(json_bytes)))
+            f.write(b'JSON')
             f.write(json_bytes)
-
-            # Binary chunk
-            f.write(struct.pack('<I', len(bin_data)))  # chunk length
-            f.write(b'BIN\x00')  # chunk type
-            f.write(bin_data)
+            f.write(struct.pack('<I', len(buffer_data)))
+            f.write(b'BIN\x00')
+            f.write(buffer_data)
 
     def _generate_preview(self):
-        """Generate a preview image of the 3D model."""
+        """Generate preview image."""
         preview_path = self.output_dir / "preview.png"
-
-        # Simple preview: render point cloud from a fixed viewpoint
-        img_size = 512
-        preview = np.ones((img_size, img_size, 3), dtype=np.uint8) * 40  # Dark gray background
+        size = 512
+        preview = np.ones((size, size, 3), dtype=np.uint8) * 30
 
         if self.points_3d is None or len(self.points_3d) == 0:
             cv2.imwrite(str(preview_path), preview)
             return
 
-        # Project points to 2D
         points = self.points_3d.copy()
 
         # Rotate for better view
-        angle = np.pi / 6
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(angle), -np.sin(angle)],
-            [0, np.sin(angle), np.cos(angle)]
-        ])
-        Ry = np.array([
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)]
-        ])
+        angle = np.pi / 5
+        Rx = np.array([[1, 0, 0], [0, np.cos(angle), -np.sin(angle)], [0, np.sin(angle), np.cos(angle)]])
+        Ry = np.array([[np.cos(angle), 0, np.sin(angle)], [0, 1, 0], [-np.sin(angle), 0, np.cos(angle)]])
         points = (Ry @ Rx @ points.T).T
 
-        # Project to image
-        focal = 300
-        cx, cy = img_size // 2, img_size // 2
+        # Project
+        focal = 250
+        cx, cy = size // 2, size // 2
 
-        # Sort by depth for proper rendering
         z_order = np.argsort(-points[:, 2])
 
         for idx in z_order:
@@ -602,35 +560,26 @@ class PhotogrammetryPipeline:
             if pt[2] < 0.1:
                 continue
 
-            x = int(focal * pt[0] / pt[2] + cx)
-            y = int(focal * pt[1] / pt[2] + cy)
+            x = int(focal * pt[0] / (pt[2] + 1) + cx)
+            y = int(focal * pt[1] / (pt[2] + 1) + cy)
 
-            if 0 <= x < img_size and 0 <= y < img_size:
-                color = (self.point_colors[idx] * 255).astype(int)
-                # Draw as small circle
-                cv2.circle(preview, (x, y), 2, color.tolist(), -1)
+            if 0 <= x < size and 0 <= y < size:
+                color = (self.point_colors[idx] * 255).astype(int).tolist()
+                cv2.circle(preview, (x, y), 2, color, -1)
 
         cv2.imwrite(str(preview_path), preview)
 
-        # Also export point cloud as PLY for debugging
-        self._export_ply()
-
     def _export_ply(self):
-        """Export point cloud as PLY file."""
+        """Export point cloud as PLY."""
         ply_path = self.output_dir / "model.ply"
 
         with open(ply_path, 'w') as f:
-            f.write("ply\n")
-            f.write("format ascii 1.0\n")
+            f.write("ply\nformat ascii 1.0\n")
             f.write(f"element vertex {len(self.points_3d)}\n")
-            f.write("property float x\n")
-            f.write("property float y\n")
-            f.write("property float z\n")
-            f.write("property uchar red\n")
-            f.write("property uchar green\n")
-            f.write("property uchar blue\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
             f.write("end_header\n")
 
             for pt, color in zip(self.points_3d, self.point_colors):
-                r, g, b = (color * 255).astype(int)
+                r, g, b = (np.clip(color, 0, 1) * 255).astype(int)
                 f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} {r} {g} {b}\n")
