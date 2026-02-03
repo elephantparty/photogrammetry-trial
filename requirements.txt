@@ -1,0 +1,19 @@
+# Photogrammetry Web Application Requirements
+
+# Web Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Image Processing & Computer Vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 3D Processing
+scipy>=1.11.0
+
+# Optional: For better 3D reconstruction (uncomment if needed)
+# open3d>=0.18.0
+
+# Development
+python-dotenv>=1.0.0
